@@ -16,7 +16,7 @@ class INA219:
         self.max_amps = max_amps
         self._calibrate()
 
-    # --- Low-level I2C (your approach - more portable) ---
+    # --- Low-level I2C ---
     def _write_register(self, reg, value):
         buf = bytearray(3)
         buf[0] = reg
