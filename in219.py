@@ -56,6 +56,7 @@ class INA219:
         self.config     = config
         self._calibrate()
 
+    # --- Low-level I2C ---
     def _write_register(self, reg, value):
         try:
             buf = bytearray(3)
