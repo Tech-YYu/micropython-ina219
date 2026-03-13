@@ -3,37 +3,32 @@ import sys
 import select
 import struct
 import time
-# ---------------------------------------------------------------
-CONFIG_32V      = 0x399F   # 32V range, 12-bit -- original config
-CONFIG_16V      = 0x199F   # 16V range, 12-bit -- original config
-CONFIG_32V_9BIT = 0x3807   # 32V range, 9-bit  -- high speed
-CONFIG_16V_9BIT = 0x1807   # 16V range, 9-bit  -- high speed
 
+CONFIG_32V      = 0x399F   
+CONFIG_16V      = 0x199F   
+CONFIG_32V_9BIT = 0x3807   
+CONFIG_16V_9BIT = 0x1807   
+
+# Active config -- swap these to change speed vs resolution
 ACTIVE_32V = CONFIG_32V_9BIT
 ACTIVE_16V = CONFIG_16V_9BIT
 
 # ---------------------------------------------------------------
-# Binary frame constants
-# ---------------------------------------------------------------
 FRAME_MAGIC   = b'\xAA\x55'
-FRAME_HDR_FMT = '!IB'              # timestamp_ms(4B) + sensor_count(1B)
-SENSOR_FMT    = '!BHHIhHB'        # id + v + i + p + sh + sv + status
+FRAME_HDR_FMT = '!IB'         # timestamp_ms(4B) + sensor_count(1B)
+SENSOR_FMT    = '!BHH'        # id_status(1B) + voltage(2B) + current(2B)
 FRAME_HDR_SZ  = struct.calcsize(FRAME_HDR_FMT)
 SENSOR_SZ     = struct.calcsize(SENSOR_FMT)
 
-# Status byte values
+# Status values -- packed into id_status byte bits[4:3]
 STATUS_OK       = 0
 STATUS_OVERFLOW = 1
 STATUS_ERROR    = 2
 STATUS_READFAIL = 3
 
-# Scaling factors (match logger.py exactly, rather than sending expensive floating point values, the script converts them to integers)
+# Scaling factors (match logger.py exactly)
 SCALE_V    = 100    # voltage   x100  -> 0.01V  LSB
 SCALE_I    = 1      # current   x1    -> 1mA    LSB
-SCALE_P    = 1      # power     x1    -> 1mW    LSB
-SCALE_SH   = 10     # shunt_mV  x10   -> 0.1mV  LSB
-SCALE_SV   = 100    # supply    x100  -> 0.01V  LSB
-
 
 # ---------------------------------------------------------------
 # INA219 Driver
@@ -56,7 +51,6 @@ class INA219:
         self.config     = config
         self._calibrate()
 
-    # --- Low-level I2C ---
     def _write_register(self, reg, value):
         try:
             buf = bytearray(3)
@@ -86,7 +80,6 @@ class INA219:
 
     def _calibrate(self):
         """
-        Page 12 of the datasheet: 
         Equation 2: Current_LSB = Max_Expected_Current / 2^15
         Equation 1: Cal = trunc(0.04096 / (Current_LSB x R_SHUNT))
         Equation 3: Power_LSB  = 20 x Current_LSB
@@ -153,9 +146,7 @@ class INA219:
 
 # ---------------------------------------------------------------
 # Clock sync
-# RP2350 has no battery-backed RTC.
-# On every boot, RTC resets to epoch (2021-01-01 00:00:00).
-# We sync with PC time over USB serial before logging starts.
+# sync with PC time over USB serial before logging starts.
 # ---------------------------------------------------------------
 _rtc = RTC()
 
@@ -250,28 +241,26 @@ def crc8(data):
 
 def build_frame(readings):
     """
-    Build a complete binary frame from a list of sensor readings.
+    Build a 48-byte binary frame from a list of sensor readings.
 
     readings: list of dicts with keys:
-        sensor_id, voltage_V, current_mA, power_mW,
-        shunt_mV, supply_V, status
+        sensor_id, voltage_V, current_mA, status
+        (power_mW derived by logger as V*I; shunt/supply dropped)
 
-    Returns: bytearray ready to write to serial.
+    Returns: bytes ready to write to serial.
     """
     ts_ms  = get_timestamp_ms()
     n      = len(readings)
     header = struct.pack(FRAME_HDR_FMT, ts_ms, n)
 
-    body = bytearray()
+    body = bytearray(n * SENSOR_SZ)
+    off  = 0
     for r in readings:
-        # Clamp and scale each value before packing
-        v  = max(0,      min(65535,      int(round(r['voltage_V']  * SCALE_V))))
-        i  = max(0,      min(65535,      int(round(r['current_mA'] * SCALE_I))))
-        p  = max(0,      min(4294967295, int(round(r['power_mW']   * SCALE_P))))
-        sh = max(-32768, min(32767,      int(round(r['shunt_mV']   * SCALE_SH))))
-        sv = max(0,      min(65535,      int(round(r['supply_V']   * SCALE_SV))))
-        body += struct.pack(SENSOR_FMT,
-                            r['sensor_id'], v, i, p, sh, sv, r['status'])
+        id_status = (r['sensor_id'] << 5) | (r['status'] << 3)
+        v = max(0, min(65535, int(round(r['voltage_V']  * SCALE_V))))
+        i = max(0, min(65535, int(round(r['current_mA'] * SCALE_I))))
+        struct.pack_into(SENSOR_FMT, body, off, id_status, v, i)
+        off += SENSOR_SZ
 
     payload = header + bytes(body)
     crc     = crc8(payload)
@@ -294,7 +283,7 @@ def build_frame(readings):
 # ---------------------------------------------------------------
 SENSORS = [
     # ===========================================================
-    # MAIN BOARD -- double check if it is correct? shunt_ohms need to be changed?
+    # MAIN BOARD -- hardcoded addresses
     # ===========================================================
     {
         "chip": "U3", "name": "ATX12", "location": "main",
@@ -343,11 +332,7 @@ SENSORS = [
 
 
 # ---------------------------------------------------------------
-# Voltage sanity ranges 
-#   12V rail: +-5%  -> 11.40 - 12.60 V
-#    5V rail: +-5%  ->  4.75 -  5.25 V
-#  3.3V rail: +-5%  ->  3.135 - 3.465 V
-# ---------------------------------------------------------------
+
 VOLTAGE_RANGES = {
     "ATX12":  (11.40, 12.60),
     "ATX5":   ( 4.75,  5.25),
@@ -374,10 +359,10 @@ JUMPER_HINTS = {
 # ---------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------
-i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=400_000)
+i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=1_000_000)
 
 print("=" * 55)
-print("INA219 Power Monitor -- Startup (high-speed binary mode)")
+print("INA219 Power Monitor -- Startup (500 Hz binary mode)")
 print("=" * 55)
 
 # Step 1: Sync clock with PC
@@ -505,12 +490,14 @@ else:
 print()
 
 # ---------------------------------------------------------------
+# Logger must switch to binary parser when it sees this line.
+# ---------------------------------------------------------------
 print("DATA_START")
 sys.stdout.flush()
 
 # ---------------------------------------------------------------
-# Main loop -- binary frame output, no sleep
-# Loop as fast as hardware allows (~99 Hz at 921600 baud)
+# Main loop -- 48-byte binary frames, no sleep
+# I2C reads per sensor (BUSVOLT, CURRENT) at 1MHz
 # ---------------------------------------------------------------
 _stdout_write = sys.stdout.buffer.write   # direct buffer write, faster than print
 
@@ -519,52 +506,52 @@ while True:
 
     for idx, cfg, sensor in sensors:
         try:
-            if sensor.is_overflow():
+            # Read BUSVOLT once -- extract overflow flag AND voltage
+            raw_bus = sensor._read_register(sensor.REG_BUSVOLT)
+            if raw_bus is None:
                 readings.append({
                     'sensor_id':  idx,
                     'voltage_V':  0.0,
                     'current_mA': 0.0,
-                    'power_mW':   0.0,
-                    'shunt_mV':   0.0,
-                    'supply_V':   0.0,
+                    'status':     STATUS_READFAIL,
+                })
+                continue
+
+            overflow  = bool(raw_bus & 0x0001)
+            voltage_V = (raw_bus >> 3) * 0.004
+
+            if overflow:
+                readings.append({
+                    'sensor_id':  idx,
+                    'voltage_V':  voltage_V,
+                    'current_mA': 0.0,
                     'status':     STATUS_OVERFLOW,
                 })
-            else:
-                v  = sensor.bus_voltage_V()
-                i  = sensor.current_mA()
-                p  = sensor.power_mW()
-                sh = sensor.shunt_voltage_mV()
-                sv = sensor.supply_voltage_V()
+                continue
 
-                if None in (v, i, p, sh, sv):
-                    readings.append({
-                        'sensor_id':  idx,
-                        'voltage_V':  0.0,
-                        'current_mA': 0.0,
-                        'power_mW':   0.0,
-                        'shunt_mV':   0.0,
-                        'supply_V':   0.0,
-                        'status':     STATUS_ERROR,
-                    })
-                else:
-                    readings.append({
-                        'sensor_id':  idx,
-                        'voltage_V':  v,
-                        'current_mA': i,
-                        'power_mW':   p,
-                        'shunt_mV':   sh,
-                        'supply_V':   sv,
-                        'status':     STATUS_OK,
-                    })
+            # Read CURRENT register -- calibrated mA value
+            raw_i = sensor._read_signed(sensor.REG_CURRENT)
+            if raw_i is None:
+                readings.append({
+                    'sensor_id':  idx,
+                    'voltage_V':  voltage_V,
+                    'current_mA': 0.0,
+                    'status':     STATUS_ERROR,
+                })
+                continue
+
+            readings.append({
+                'sensor_id':  idx,
+                'voltage_V':  voltage_V,
+                'current_mA': raw_i * sensor.current_lsb * 1000,
+                'status':     STATUS_OK,
+            })
 
         except OSError:
             readings.append({
                 'sensor_id':  idx,
                 'voltage_V':  0.0,
                 'current_mA': 0.0,
-                'power_mW':   0.0,
-                'shunt_mV':   0.0,
-                'supply_V':   0.0,
                 'status':     STATUS_READFAIL,
             })
 
